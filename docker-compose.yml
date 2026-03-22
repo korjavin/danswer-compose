@@ -1,0 +1,247 @@
+version: '3.8'
+
+# Danswer / Onyx — git-ops compose deployment
+# Images: onyxdotapp/onyx-{backend,web-server,model-server}
+# Sidecars: PostgreSQL, Vespa, Redis, MinIO
+# Auth: OIDC (Authentik or any OIDC provider)
+
+services:
+
+  # ── Web Frontend (Next.js) ────────────────────────────────────────────
+  danswer-web:
+    image: ${WEB_IMAGE:-ghcr.io/korjavin/danswer-web-vendor:latest}
+    container_name: ${WEB_CONTAINER_NAME:-danswer-web}
+    restart: unless-stopped
+    depends_on:
+      - danswer-api
+    networks:
+      - internal
+      - traefik_network
+    environment:
+      INTERNAL_URL: http://danswer-api:8080
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK_NAME:-traefik_default}"
+      - "traefik.http.routers.danswer-web.rule=Host(`${SERVICE_HOST}`)"
+      - "traefik.http.routers.danswer-web.entrypoints=websecure"
+      - "traefik.http.routers.danswer-web.tls.certresolver=${TRAEFIK_CERTRESOLVER:-myresolver}"
+      - "traefik.http.services.danswer-web.loadbalancer.server.port=3000"
+      - "traefik.http.routers.danswer-web.priority=1"
+      # Danswer has its own OIDC auth — do NOT add forward-auth middleware here.
+      # If you want an extra layer, uncomment:
+      # - "traefik.http.routers.danswer-web.middlewares=auth-errors@docker,forward-auth@docker"
+
+  # ── API Backend ───────────────────────────────────────────────────────
+  danswer-api:
+    image: ${API_IMAGE:-ghcr.io/korjavin/danswer-backend-vendor:latest}
+    container_name: ${API_CONTAINER_NAME:-danswer-api}
+    restart: unless-stopped
+    command: >
+      /bin/sh -c "
+        alembic upgrade head &&
+        echo 'Starting Danswer API Server' &&
+        uvicorn danswer.main:app --host 0.0.0.0 --port 8080
+      "
+    depends_on:
+      - danswer-db
+      - danswer-index
+      - danswer-cache
+      - danswer-minio
+    networks:
+      - internal
+      - traefik_network
+    volumes:
+      - app-data:/home/user/danswer
+    environment:
+      # ── Database ─────────────────────────────
+      POSTGRES_HOST: danswer-db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-danswer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-danswer}
+      # ── Vespa search ─────────────────────────
+      VESPA_HOST: danswer-index
+      VESPA_PORT: 8081
+      # ── Redis ────────────────────────────────
+      REDIS_HOST: danswer-cache
+      REDIS_PORT: 6379
+      # ── Model servers ────────────────────────
+      INFERENCE_MODEL_SERVER_HOST: danswer-inference-model
+      INFERENCE_MODEL_SERVER_PORT: 9000
+      INDEXING_MODEL_SERVER_HOST: danswer-indexing-model
+      INDEXING_MODEL_SERVER_PORT: 9001
+      # ── Object storage (MinIO/S3) ─────────────
+      FILE_STORE_BACKEND: ${FILE_STORE_BACKEND:-s3}
+      S3_ENDPOINT_URL: http://danswer-minio:9000
+      S3_FILE_STORE_BUCKET_NAME: ${S3_BUCKET_NAME:-danswer-files}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio_admin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # ── Auth (OIDC) ───────────────────────────
+      AUTH_TYPE: ${AUTH_TYPE:-oidc}
+      OAUTH_CLIENT_ID: ${OAUTH_CLIENT_ID}
+      OAUTH_CLIENT_SECRET: ${OAUTH_CLIENT_SECRET}
+      OPENID_CONFIG_URL: ${OPENID_CONFIG_URL}
+      # ── App ───────────────────────────────────
+      WEB_DOMAIN: https://${SERVICE_HOST}
+      SECRET: ${DANSWER_SECRET}
+      ENCRYPTION_KEY_SECRET: ${ENCRYPTION_KEY_SECRET}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # ── LLM providers (uncomment as needed) ───
+      # OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      # AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${TRAEFIK_NETWORK_NAME:-traefik_default}"
+      - "traefik.http.routers.danswer-api.rule=Host(`${SERVICE_HOST}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.danswer-api.entrypoints=websecure"
+      - "traefik.http.routers.danswer-api.tls.certresolver=${TRAEFIK_CERTRESOLVER:-myresolver}"
+      - "traefik.http.services.danswer-api.loadbalancer.server.port=8080"
+      - "traefik.http.routers.danswer-api.priority=10"
+
+  # ── Background Worker (indexing, connectors) ──────────────────────────
+  danswer-background:
+    image: ${API_IMAGE:-ghcr.io/korjavin/danswer-backend-vendor:latest}
+    container_name: ${BACKGROUND_CONTAINER_NAME:-danswer-background}
+    restart: unless-stopped
+    command: /bin/sh -c "/usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.conf"
+    depends_on:
+      - danswer-db
+      - danswer-index
+      - danswer-cache
+      - danswer-minio
+    networks:
+      - internal
+    volumes:
+      - app-data:/home/user/danswer
+    environment:
+      # ── Database ─────────────────────────────
+      POSTGRES_HOST: danswer-db
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: ${POSTGRES_USER:-danswer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-danswer}
+      # ── Vespa search ─────────────────────────
+      VESPA_HOST: danswer-index
+      VESPA_PORT: 8081
+      # ── Redis ────────────────────────────────
+      REDIS_HOST: danswer-cache
+      REDIS_PORT: 6379
+      # ── Model servers ────────────────────────
+      INFERENCE_MODEL_SERVER_HOST: danswer-inference-model
+      INFERENCE_MODEL_SERVER_PORT: 9000
+      INDEXING_MODEL_SERVER_HOST: danswer-indexing-model
+      INDEXING_MODEL_SERVER_PORT: 9001
+      # ── Object storage (MinIO/S3) ─────────────
+      FILE_STORE_BACKEND: ${FILE_STORE_BACKEND:-s3}
+      S3_ENDPOINT_URL: http://danswer-minio:9000
+      S3_FILE_STORE_BUCKET_NAME: ${S3_BUCKET_NAME:-danswer-files}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio_admin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # ── Auth ─────────────────────────────────
+      AUTH_TYPE: ${AUTH_TYPE:-oidc}
+      OAUTH_CLIENT_ID: ${OAUTH_CLIENT_ID}
+      OAUTH_CLIENT_SECRET: ${OAUTH_CLIENT_SECRET}
+      OPENID_CONFIG_URL: ${OPENID_CONFIG_URL}
+      # ── App ───────────────────────────────────
+      WEB_DOMAIN: https://${SERVICE_HOST}
+      SECRET: ${DANSWER_SECRET}
+      ENCRYPTION_KEY_SECRET: ${ENCRYPTION_KEY_SECRET}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+  # ── Inference Model Server ────────────────────────────────────────────
+  danswer-inference-model:
+    image: ${MODEL_IMAGE:-ghcr.io/korjavin/danswer-model-vendor:latest}
+    container_name: ${INFERENCE_MODEL_CONTAINER_NAME:-danswer-inference-model}
+    restart: unless-stopped
+    networks:
+      - internal
+    volumes:
+      - model-cache:/root/.cache/huggingface
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+
+  # ── Indexing Model Server ─────────────────────────────────────────────
+  danswer-indexing-model:
+    image: ${MODEL_IMAGE:-ghcr.io/korjavin/danswer-model-vendor:latest}
+    container_name: ${INDEXING_MODEL_CONTAINER_NAME:-danswer-indexing-model}
+    restart: unless-stopped
+    networks:
+      - internal
+    volumes:
+      - model-cache:/root/.cache/huggingface
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Bind on 9001 so it does not clash with inference server on 9000
+      INDEXING_ONLY: "true"
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────
+  danswer-db:
+    image: ${POSTGRES_IMAGE:-postgres:15.2-alpine}
+    container_name: ${DB_CONTAINER_NAME:-danswer-db}
+    restart: unless-stopped
+    networks:
+      - internal
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-danswer}
+      POSTGRES_USER: ${POSTGRES_USER:-danswer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    command: -c 'max_connections=250'
+    shm_size: '1gb'
+
+  # ── Vespa Search Engine ───────────────────────────────────────────────
+  danswer-index:
+    image: ${VESPA_IMAGE:-ghcr.io/korjavin/danswer-vespa-vendor:latest}
+    container_name: ${VESPA_CONTAINER_NAME:-danswer-index}
+    restart: unless-stopped
+    networks:
+      - internal
+    volumes:
+      - index-data:/opt/vespa/var
+
+  # ── Redis ─────────────────────────────────────────────────────────────
+  danswer-cache:
+    image: ${REDIS_IMAGE:-redis:7.4-alpine}
+    container_name: ${REDIS_CONTAINER_NAME:-danswer-cache}
+    restart: unless-stopped
+    networks:
+      - internal
+
+  # ── MinIO Object Storage ──────────────────────────────────────────────
+  danswer-minio:
+    image: ${MINIO_IMAGE:-minio/minio:latest}
+    container_name: ${MINIO_CONTAINER_NAME:-danswer-minio}
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    networks:
+      - internal
+    volumes:
+      - minio-data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+
+networks:
+  internal:
+    name: ${INTERNAL_NETWORK_NAME:-danswer_internal}
+  traefik_network:
+    external: true
+    name: ${TRAEFIK_NETWORK_NAME:-traefik_default}
+
+volumes:
+  db-data:
+    name: ${DB_VOLUME_NAME:-danswer_db-data}
+  index-data:
+    name: ${INDEX_VOLUME_NAME:-danswer_index-data}
+  minio-data:
+    name: ${MINIO_VOLUME_NAME:-danswer_minio-data}
+  model-cache:
+    name: ${MODEL_CACHE_VOLUME_NAME:-danswer_model-cache}
+  app-data:
+    name: ${APP_DATA_VOLUME_NAME:-danswer_app-data}

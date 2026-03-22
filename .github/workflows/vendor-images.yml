@@ -1,0 +1,100 @@
+name: Vendor Danswer Images to GHCR
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'  # Weekly on Monday at 04:00 UTC
+  workflow_dispatch:
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Vendor onyx-backend
+        env:
+          UPSTREAM: onyxdotapp/onyx-backend:latest
+          GHCR: ghcr.io/${{ github.repository_owner }}/danswer-backend-vendor
+        run: |
+          docker pull "${UPSTREAM}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${UPSTREAM}" | cut -d@ -f2)
+          docker tag "${UPSTREAM}" "${GHCR}:latest"
+          docker push "${GHCR}:latest"
+          echo "danswer-backend-vendor digest: ${DIGEST}"
+          echo "BACKEND_DIGEST=${DIGEST}" >> "${GITHUB_ENV}"
+
+      - name: Vendor onyx-web-server
+        env:
+          UPSTREAM: onyxdotapp/onyx-web-server:latest
+          GHCR: ghcr.io/${{ github.repository_owner }}/danswer-web-vendor
+        run: |
+          docker pull "${UPSTREAM}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${UPSTREAM}" | cut -d@ -f2)
+          docker tag "${UPSTREAM}" "${GHCR}:latest"
+          docker push "${GHCR}:latest"
+          echo "danswer-web-vendor digest: ${DIGEST}"
+          echo "WEB_DIGEST=${DIGEST}" >> "${GITHUB_ENV}"
+
+      - name: Vendor onyx-model-server
+        env:
+          UPSTREAM: onyxdotapp/onyx-model-server:latest
+          GHCR: ghcr.io/${{ github.repository_owner }}/danswer-model-vendor
+        run: |
+          docker pull "${UPSTREAM}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${UPSTREAM}" | cut -d@ -f2)
+          docker tag "${UPSTREAM}" "${GHCR}:latest"
+          docker push "${GHCR}:latest"
+          echo "danswer-model-vendor digest: ${DIGEST}"
+          echo "MODEL_DIGEST=${DIGEST}" >> "${GITHUB_ENV}"
+
+      - name: Vendor vespa (pinned version)
+        env:
+          UPSTREAM: vespaengine/vespa:8.609.39
+          GHCR: ghcr.io/${{ github.repository_owner }}/danswer-vespa-vendor
+        run: |
+          docker pull "${UPSTREAM}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "${UPSTREAM}" | cut -d@ -f2)
+          docker tag "${UPSTREAM}" "${GHCR}:latest"
+          docker tag "${UPSTREAM}" "${GHCR}:8.609.39"
+          docker push "${GHCR}:latest"
+          docker push "${GHCR}:8.609.39"
+          echo "danswer-vespa-vendor digest: ${DIGEST}"
+          echo "VESPA_DIGEST=${DIGEST}" >> "${GITHUB_ENV}"
+
+      - name: Update deploy branch and log digests
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          git checkout -B deploy
+
+          # Log vendored digests for traceability
+          cat >> .env.example << EOF
+
+          # --- Latest vendored digests (updated $(date -u +%Y-%m-%dT%H:%M:%SZ)) ---
+          # API_IMAGE=ghcr.io/${{ github.repository_owner }}/danswer-backend-vendor@${BACKEND_DIGEST}
+          # WEB_IMAGE=ghcr.io/${{ github.repository_owner }}/danswer-web-vendor@${WEB_DIGEST}
+          # MODEL_IMAGE=ghcr.io/${{ github.repository_owner }}/danswer-model-vendor@${MODEL_DIGEST}
+          # VESPA_IMAGE=ghcr.io/${{ github.repository_owner }}/danswer-vespa-vendor@${VESPA_DIGEST}
+          EOF
+
+          git add .env.example
+          git diff --cached --quiet || git commit -m "chore: update vendored image digests $(date -u +%Y-%m-%d)"
+          git push origin deploy --force
+
+      - name: Trigger Portainer Redeploy Webhook
+        uses: distributhor/workflow-webhook@2381f0e9c7b6bf061fb1405bd0804b8706116369 # v3.0.8
+        with:
+          webhook_url: ${{ secrets.PORTAINER_REDEPLOY_HOOK }}
+          webhook_secret: "trigger"
